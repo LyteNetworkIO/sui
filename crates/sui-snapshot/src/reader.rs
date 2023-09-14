@@ -8,6 +8,7 @@ use crate::{
 use anyhow::{anyhow, Context, Result};
 use byteorder::{BigEndian, ReadBytesExt};
 use bytes::{Buf, Bytes};
+use fastcrypto::hash::MultisetHash;
 use fastcrypto::hash::{HashFunction, Sha3_256};
 use futures::future::{AbortRegistration, Abortable};
 use futures::{StreamExt, TryStreamExt};
@@ -26,9 +27,11 @@ use sui_core::authority::AuthorityStore;
 use sui_storage::blob::{Blob, BlobEncoding};
 use sui_storage::object_store::util::{copy_file, copy_files, path_to_filesystem};
 use sui_storage::object_store::ObjectStoreConfig;
+use sui_types::accumulator::Accumulator;
 use sui_types::base_types::{ObjectDigest, ObjectID, ObjectRef, SequenceNumber};
 use tokio::sync::Mutex;
 
+pub type SnapshotChecksums = (DigestByBucketAndPartition, Accumulator, HashSet<(u32, u32)>);
 pub type DigestByBucketAndPartition = BTreeMap<u32, BTreeMap<u32, [u8; 32]>>;
 pub struct StateSnapshotReaderV1 {
     epoch: u64,
@@ -129,19 +132,22 @@ impl StateSnapshotReaderV1 {
         })
     }
 
-    pub async fn read(
-        &mut self,
-        perpetual_db: &AuthorityPerpetualTables,
-        abort_registration: AbortRegistration,
-    ) -> Result<()> {
-        // This computes and stores the sha3 digest of object references in REFERENCE file for each
-        // bucket partition. When downloading objects, we will match sha3 digest of object references
-        // per *.obj file against this. We do this so during restore we can pre fetch object
-        // references and start building state accumulator and fail early if the state root hash
-        // doesn't match but we still need to ensure that objects match references exactly.
+    /// Compute the three pieces of data used to confirm validity of the snapshot:
+    /// 1. The per-bucket/partition SHA3 digests of all corresponding objects. This
+    ///     is used to confirm that the contents of the downloaded snapshot match what
+    ///     was written to the object store.
+    /// 2. The accumulator of all ObjectRefs contained in the snapshot. This is used to
+    ///     confirm that the contents of the downloaded snapshot match what was committed
+    ///     to by the network at the end of the corresponding epoch
+    /// 3. The set of all (bucket, partition) pairs in the snapshot. This is used to
+    ///    confirm that we have read all buckets and partitions in the snapshot.
+    pub async fn get_checksums(&self) -> Result<SnapshotChecksums> {
+        // let mut sha3_digests: DigestByBucketAndPartition = BTreeMap::new();
         let sha3_digests: Arc<Mutex<DigestByBucketAndPartition>> =
             Arc::new(Mutex::new(BTreeMap::new()));
+
         let mut all_files: HashSet<(u32, u32)> = HashSet::new();
+        let mut accumulator = Accumulator::default();
 
         for bucket in self.buckets()?.iter() {
             let mut sha3_digests = sha3_digests.lock().await;
@@ -162,6 +168,7 @@ impl StateSnapshotReaderV1 {
                     current_part_num = part_num;
                 }
                 hasher.update(object_ref.2.inner());
+                accumulator.insert(object_ref.2);
             }
             if !empty {
                 sha3_digests
@@ -172,6 +179,21 @@ impl StateSnapshotReaderV1 {
                 all_files.insert((*bucket, current_part_num.try_into().unwrap()));
             }
         }
+
+        let sha3_digests_ret = sha3_digests.lock().await.clone();
+        Ok((sha3_digests_ret, accumulator, all_files))
+    }
+
+    pub async fn read(
+        &mut self,
+        perpetual_db: &AuthorityPerpetualTables,
+        sha3_digests: DigestByBucketAndPartition,
+        all_files: HashSet<(u32, u32)>,
+        abort_registration: AbortRegistration,
+    ) -> Result<()> {
+        let mut all_files = all_files.clone();
+        let sha3_digests: Arc<Mutex<DigestByBucketAndPartition>> =
+            Arc::new(Mutex::new(sha3_digests));
 
         let input_files: Vec<_> = self
             .object_files
@@ -241,7 +263,7 @@ impl StateSnapshotReaderV1 {
         .await?
     }
 
-    pub fn ref_iter(&mut self, bucket_num: u32) -> Result<ObjectRefIter> {
+    pub fn ref_iter(&self, bucket_num: u32) -> Result<ObjectRefIter> {
         let file_metadata = self
             .ref_files
             .get(&bucket_num)
